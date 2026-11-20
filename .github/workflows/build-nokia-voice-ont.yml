@@ -1,0 +1,133 @@
+name: Build Nokia XG-140G-TF
+
+run-name: Build Nokia XG-140G-TF ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (leave empty to only build artifacts)"
+        required: false
+        type: string
+      prerelease:
+        description: Mark as prerelease
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-nokia-xg-140g-tf-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build nokia_xg-140g-tf
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    environment: release
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free build space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: ponwrt-dl-nokia-xg-140g-tf-${{ hashFiles('feeds.conf.default', 'configs/nokia_xg-140g-tf-ubi.config', 'configs/release.config') }}
+          restore-keys: |
+            ponwrt-dl-nokia-xg-140g-tf-
+
+      - name: Install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load repository signing key
+        env:
+          PONWRT_APK_PRIVATE_KEY: ${{ secrets.PONWRT_APK_PRIVATE_KEY }}
+        run: |
+          if [ -n "$PONWRT_APK_PRIVATE_KEY" ]; then
+            umask 077
+            printf '%s\n' "$PONWRT_APK_PRIVATE_KEY" > private-key.pem
+            openssl ec -in private-key.pem -pubout -out public-key.pem
+          fi
+
+      - name: Configure nokia_xg-140g-tf
+        run: |
+          ./scripts/kconfig.pl + \
+            "configs/nokia_xg-140g-tf-ubi.config" \
+            configs/release.config > .config
+          make defconfig
+          echo "Selected devices:"
+          grep -E '^CONFIG_TARGET_DEVICE_.*=y' .config
+
+      - name: Download sources
+        run: make download -j"$(nproc)"
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Pack
+        run: |
+          mkdir -p release
+          tar --zstd -cf "release/ponwrt-nokia-xg-140g-tf.tar.zst" \
+            -C bin/targets/airoha an7581
+          ls -lh release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ponwrt-nokia-xg-140g-tf
+          path: release/*.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create checksums
+        if: ${{ inputs.tag != '' }}
+        working-directory: release
+        run: sha256sum *.tar.zst > sha256sums
+
+      - name: Create GitHub release
+        if: ${{ inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=(
+            "$RELEASE_TAG"
+            release/*.tar.zst
+            release/sha256sums
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "PonWrt $RELEASE_TAG (Nokia XG-140G-TF)"
+            --generate-notes
+          )
+          if [ "$PRERELEASE" = true ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"
